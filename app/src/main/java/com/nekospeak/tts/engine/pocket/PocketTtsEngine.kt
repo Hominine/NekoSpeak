@@ -42,13 +42,14 @@ class PocketTtsEngine(
         const val ODE_STEPS = 20  // More steps = better quality (default: 10, max: 50)
         
         // Model paths (relative to filesDir/pocket/models/)
-        // Note: mimi_encoder and text_conditioner are FP32 only (no INT8 version available)
         private const val MODELS_DIR = "pocket/models"
-        private const val MODEL_MIMI_ENCODER = "mimi_encoder.onnx"
-        private const val MODEL_TEXT_CONDITIONER = "text_conditioner.onnx"
-        private const val MODEL_FLOW_LM_MAIN = "flow_lm_main_int8.onnx"
-        private const val MODEL_FLOW_LM_FLOW = "flow_lm_flow_int8.onnx"
-        private const val MODEL_MIMI_DECODER = "mimi_decoder_int8.onnx"
+        private const val MODEL_MIMI_ENCODER     = "mimi_encoder_int8.onnx"
+        private const val MODEL_TEXT_CONDITIONER = "text_conditioner_int8.onnx"
+        private const val MODEL_FLOW_LM_MAIN     = "flow_lm_main_int8.onnx"
+        private const val MODEL_FLOW_LM_FLOW     = "flow_lm_flow_int8.onnx"
+        private const val MODEL_MIMI_DECODER     = "mimi_decoder_int8.onnx"
+
+        private const val BOS_BEFORE_VOICE_PATH = "pocket/bos_before_voice.npy"
         
         // Bundled voices path
         private const val BUNDLED_VOICES_DIR = "pocket/voices"
@@ -67,6 +68,11 @@ class PocketTtsEngine(
     private var mimiCodec: MimiCodec? = null
     private var tokenizer: PocketTokenizer? = null
     private var gtcrnDenoiser: GtcrnDenoiser? = null
+
+    // Pre-computed BOS embedding prepended to voice embeddings before voice conditioning pass.
+    // Required by the multilingual v2 bundle (bundle.json: insert_bos_before_voice = true).
+    private var bosEmbedding: FloatArray? = null
+    private var bosFrames: Int = 0
     
     private val voiceStates = mutableMapOf<String, PocketVoiceState>()
     private var currentVoice: String = "alba"
@@ -222,6 +228,9 @@ class PocketTtsEngine(
                     gtcrnDenoiser?.initialize()
                 }
                 
+                // Load BOS-before-voice embedding (required by multilingual v2 bundle)
+                loadBosBeforeVoice()
+
                 // Load available voices
                 loadBundledVoices()
                 loadClonedVoices()
@@ -282,6 +291,59 @@ class PocketTtsEngine(
         }
     }
     
+    private fun loadBosBeforeVoice() {
+        val file = File(context.filesDir, BOS_BEFORE_VOICE_PATH)
+        if (!file.exists()) {
+            Log.w(TAG, "bos_before_voice.npy not found — voice conditioning BOS token will be skipped")
+            return
+        }
+        val result = parseNpyFloat32(file.readBytes())
+        if (result == null) {
+            Log.e(TAG, "Failed to parse bos_before_voice.npy")
+            return
+        }
+        val (data, shape) = result
+        // Shape is (1, B, EMBED_DIM); B is the number of BOS frames (typically 1)
+        bosFrames = if (shape.size >= 2) shape[shape.size - 2] else 1
+        bosEmbedding = data
+        Log.i(TAG, "Loaded bos_before_voice: $bosFrames frame(s), ${data.size} floats")
+    }
+
+    private fun parseNpyFloat32(bytes: ByteArray): Pair<FloatArray, IntArray>? {
+        if (bytes.size < 10) return null
+        val expected = byteArrayOf(0x93.toByte(), 'N'.code.toByte(), 'U'.code.toByte(),
+                                   'M'.code.toByte(), 'P'.code.toByte(), 'Y'.code.toByte())
+        for (i in expected.indices) {
+            if (bytes[i] != expected[i]) {
+                Log.e(TAG, "Invalid NPY magic bytes")
+                return null
+            }
+        }
+        val major = bytes[6].toInt() and 0xFF
+        val headerLen: Int
+        val headerOffset: Int
+        if (major == 1) {
+            headerLen = ((bytes[9].toInt() and 0xFF) shl 8) or (bytes[8].toInt() and 0xFF)
+            headerOffset = 10
+        } else {
+            headerLen = ((bytes[11].toInt() and 0xFF) shl 24) or ((bytes[10].toInt() and 0xFF) shl 16) or
+                        ((bytes[9].toInt()  and 0xFF) shl 8)  or (bytes[8].toInt()  and 0xFF)
+            headerOffset = 12
+        }
+        val header = String(bytes, headerOffset, headerLen, Charsets.US_ASCII)
+        val shapeMatch = Regex("'shape':\\s*\\(([^)]*)\\)").find(header)
+            ?: return null
+        val shape = shapeMatch.groupValues[1].split(",")
+            .map { it.trim() }.filter { it.isNotEmpty() }
+            .map { it.toInt() }.toIntArray()
+        val dataOffset = headerOffset + headerLen
+        val numFloats = (bytes.size - dataOffset) / 4
+        val buf = java.nio.ByteBuffer.wrap(bytes, dataOffset, bytes.size - dataOffset)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val data = FloatArray(numFloats) { buf.float }
+        return Pair(data, shape)
+    }
+
     // Voice embeddings cache: voiceId -> FloatArray of shape [N * 1024] flattened
     private val voiceEmbeddings = mutableMapOf<String, FloatArray>()
     private val voiceEmbeddingFrames = mutableMapOf<String, Int>()
@@ -1000,14 +1062,25 @@ class PocketTtsEngine(
             val numTextTokens = tokens.size
             
             // Voice embeddings from voice state [numFrames, 1024]
-            val voiceEmbeddings = voiceState.latents
-            val numVoiceFrames = voiceState.numFrames
-            
+            // Prepend bos_before_voice embedding when available (required by multilingual v2 bundle).
+            val (voiceEmbeddings, numVoiceFrames) = run {
+                val bos = bosEmbedding
+                if (bos != null && bosFrames > 0) {
+                    val raw = voiceState.latents
+                    val combined = FloatArray(bos.size + raw.size)
+                    bos.copyInto(combined)
+                    raw.copyInto(combined, bos.size)
+                    Pair(combined, voiceState.numFrames + bosFrames)
+                } else {
+                    Pair(voiceState.latents, voiceState.numFrames)
+                }
+            }
+
             // Empty tensors for conditioning passes
             val emptySeq = FloatArray(0) // [1, 0, 32]
             val emptyText = FloatArray(0) // [1, 0, 1024]
-            
-            // PASS 1: Voice conditioning - empty sequence, voice embeddings
+
+            // PASS 1: Voice conditioning - empty sequence, voice embeddings (with BOS prepended)
             Log.d(TAG, "Pass 1: Voice conditioning ($numVoiceFrames frames)")
             runFlowLmMainPass(session, emptySeq, 0, voiceEmbeddings, numVoiceFrames)
             
