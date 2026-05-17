@@ -40,6 +40,7 @@ class PocketTtsEngine(
         const val LATENT_DIM = 32
         const val EMBED_DIM = 1024
         const val ODE_STEPS = 20  // More steps = better quality (default: 10, max: 50)
+        private const val KV_CACHE_WINDOW = 40 // Keep last 40 frames (~3.2s); prevents O(n) inference growth
         
         // Model paths (relative to filesDir/pocket/models/)
         private const val MODELS_DIR = "pocket/models"
@@ -86,6 +87,8 @@ class PocketTtsEngine(
     // Flow LM state (for autoregressive generation) - map of state name to tensor data
     // Each entry has: name -> Pair(type: String, data: Any) where data is FloatArray or LongArray
     private var flowLmState: MutableMap<String, Pair<String, Any>>? = null
+    // Static shapes from model spec (may contain -1 for dynamic dims); used for KV cache windowing
+    private var flowLmStateShapes: MutableMap<String, LongArray>? = null
     
     // Pre-computed flow buffers for Euler integration (s/t time steps)
     // Computed once per lsdSteps value to avoid repeated allocation
@@ -1450,7 +1453,9 @@ class PocketTtsEngine(
                             FloatArray(buf.remaining()).also { buf.get(it) }
                         }
                     }
-                    flowLmState!![stateName] = Pair(typeAndData.first, newData)
+                    val staticShape = flowLmStateShapes?.get(stateName)
+                    val windowedData = if (staticShape != null) truncateKvCache(newData, staticShape, KV_CACHE_WINDOW) else newData
+                    flowLmState!![stateName] = Pair(typeAndData.first, windowedData)
                 }
             }
             
@@ -1555,7 +1560,8 @@ class PocketTtsEngine(
         val session = flowLmMain ?: return
         
         val stateMap = mutableMapOf<String, Pair<String, Any>>()
-        
+        val shapeMap = mutableMapOf<String, LongArray>()
+
         session.inputInfo.forEach { (name, info) ->
             if (name.startsWith("state_")) {
                 val tensorInfo = info.info as? ai.onnxruntime.TensorInfo ?: return@forEach
@@ -1564,21 +1570,23 @@ class PocketTtsEngine(
                 // The model grows these during autoregressive generation
                 val size = shape.fold(1L) { acc, dim -> acc * if (dim < 0) 0 else dim }.toInt().coerceAtLeast(0)
                 val type = tensorInfo.type.toString()
-                
+
                 Log.d(TAG, "State $name: type=$type, shape=${shape.contentToString()}, size=$size")
-                
+
                 val data: Any = when {
                     type.contains("int64", ignoreCase = true) -> LongArray(size) { 0L }
                     type.contains("bool", ignoreCase = true) -> LongArray(size) { 0L }
                     else -> FloatArray(size) { 0f }
                 }
-                
+
                 stateMap[name] = Pair(type, data)
+                shapeMap[name] = shape
             }
         }
-        
+
         Log.d(TAG, "Initialized ${stateMap.size} flow LM states")
         flowLmState = stateMap
+        flowLmStateShapes = shapeMap
     }
     
     private fun updateFlowLmState(latent: FloatArray) {
@@ -1587,6 +1595,40 @@ class PocketTtsEngine(
     
     private fun resetFlowLmState() {
         flowLmState = null
+        flowLmStateShapes = null
+    }
+
+    /**
+     * Truncate KV cache state along its dynamic (sequence) dimension to at most [maxFrames].
+     * Handles any position of the dynamic dim: treats all dims before it as batch and all dims
+     * after it as frame stride, then copies the last [maxFrames] slices for each batch entry.
+     */
+    private fun truncateKvCache(data: Any, staticShape: LongArray, maxFrames: Int): Any {
+        val dynIdx = staticShape.indexOfFirst { it < 0 }
+        if (dynIdx < 0) return data
+
+        val batchCount = staticShape.take(dynIdx).fold(1L) { acc, d -> acc * d }.toInt()
+        val frameStride = staticShape.drop(dynIdx + 1).fold(1L) { acc, d -> acc * d }.toInt()
+        val totalPerBatch = batchCount * frameStride
+
+        fun <T> truncate(src: T, size: Int, newArray: (Int) -> T, copyRange: (T, Int, T, Int, Int) -> Unit): T {
+            val numFrames = size / totalPerBatch
+            if (numFrames <= maxFrames) return src
+            val skipFrames = numFrames - maxFrames
+            val dst = newArray(batchCount * maxFrames * frameStride)
+            for (b in 0 until batchCount) {
+                val srcStart = b * numFrames * frameStride + skipFrames * frameStride
+                val dstStart = b * maxFrames * frameStride
+                copyRange(src, srcStart, dst, dstStart, maxFrames * frameStride)
+            }
+            return dst
+        }
+
+        return when (data) {
+            is FloatArray -> truncate(data, data.size, ::FloatArray) { s, si, d, di, n -> System.arraycopy(s, si, d, di, n) }
+            is LongArray  -> truncate(data, data.size, ::LongArray)  { s, si, d, di, n -> System.arraycopy(s, si, d, di, n) }
+            else -> data
+        }
     }
     
     /**
